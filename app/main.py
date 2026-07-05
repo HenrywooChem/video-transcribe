@@ -26,11 +26,16 @@ if _env_file.exists():
 
 # 确保关键 Key 存在（优先使用百炼，其次是 DeepSeek）
 _DASHSCOPE_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+_DASHSCOPE_WORKSPACE = os.environ.get("DASHSCOPE_WORKSPACE", "")
 _DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 _LLM_PROVIDER = "deepseek" if _DEEPSEEK_KEY else ("dashscope" if _DASHSCOPE_KEY else "none")
 
 # 外部可访问的基础URL（用于 ASR API 下载音频文件）
 _PUBLIC_BASE_URL = "https://ai4u.site"
+
+# 微信小程序配置
+_WX_APPID = os.environ.get("WX_APPID", "")
+_WX_SECRET = os.environ.get("WX_SECRET", "")
 
 # ============================================================
 # 配置
@@ -139,7 +144,7 @@ init_users_db()
 # ============================================================
 # 用户额度系统（每月免费30分钟 + 每日签到+5分钟）
 # ============================================================
-MONTHLY_FREE_MINUTES = 30   # 每月免费30分钟
+MONTHLY_FREE_MINUTES = 300   # 每月免费30分钟
 CHECKIN_BONUS_MINUTES = 5   # 每日签到加5分钟
 
 def get_current_month() -> str:
@@ -196,6 +201,8 @@ def get_user_quota(username: str) -> dict:
             "free_seconds": MONTHLY_FREE_MINUTES * 60,
             "bonus_seconds": 0,
             "used_seconds": 0,
+            "available_seconds": MONTHLY_FREE_MINUTES * 60,
+            "total_seconds": MONTHLY_FREE_MINUTES * 60,
             "last_checkin_date": None,
             "can_checkin": True,
         }
@@ -446,22 +453,31 @@ def save_tasks():
 load_tasks()
 
 # ============================================================
-# 百炼语音识别（替代本地 FunASR，不占用内存）
+# ============================================================
+# 百炼工作空间 ASR（通过 OpenAI 兼容接口调用 fun-asr-flash）
 # ============================================================
 async def transcribe_audio(audio_path: Path) -> dict:
-    """用百炼 DashScope ASR 云端转录（不加载模型到本地内存）"""
+    """用百炼工作空间 fun-asr-flash 云端转录"""
     import subprocess, json, time
+    from openai import OpenAI
+
+    _ASR_API_BASE = os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com")
+    _ASR_API_KEY = _DASHSCOPE_KEY or os.environ.get("DASHSCOPE_API_KEY", "")
+    _ASR_MODEL = os.environ.get("ASR_MODEL", "fun-asr-flash-2026-06-15")
 
     # 获取音频时长
     def _get_duration() -> float:
         cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
                "-show_streams", str(audio_path)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        info = json.loads(r.stdout)
-        for s in info.get("streams", []):
-            dur = s.get("duration")
-            if dur:
-                return float(dur)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            info = json.loads(r.stdout)
+            for s in info.get("streams", []):
+                dur = s.get("duration")
+                if dur:
+                    return float(dur)
+        except Exception:
+            pass
         return 0.0
 
     duration = _get_duration()
@@ -469,83 +485,54 @@ async def transcribe_audio(audio_path: Path) -> dict:
         return {"language": "zh", "duration": 0,
                 "segments": [{"start": 0.0, "end": 0.0, "text": "(音频时长获取失败)"}]}
 
-    # 构建文件公开 URL（DashScope API 需要可下载的 HTTP 地址）
+    # 构建文件公开 URL
     filename = audio_path.name
-    # 兼容文件在 UPLOAD_DIR 子目录的情况（URL下载任务）
     import urllib.parse
     try:
         relative = audio_path.relative_to(UPLOAD_DIR)
         temp_path = str(relative)
     except ValueError:
         temp_path = filename
-    # URL编码（中文/空格等特殊字符会破坏URL）
     encoded_path = urllib.parse.quote(temp_path, safe='/')
     public_url = f"{_PUBLIC_BASE_URL}/temp_audio/{encoded_path}"
 
-    import dashscope
-    from dashscope.audio.asr import Transcription
-
-    dashscope.api_key = _DASHSCOPE_KEY
-
-    # 提交异步转录任务
-    resp = Transcription.async_call(
-        model='paraformer-v1',
-        file_urls=[public_url],
-    )
-    if resp.status_code != 200:
-        err = resp.output.message if hasattr(resp.output, 'message') else str(resp)
+    # 用 OpenAI 兼容接口调用 ASR（同步）
+    try:
+        client = OpenAI(
+            api_key=_ASR_API_KEY,
+            base_url=f"{_ASR_API_BASE}/compatible-mode/v1" if not _ASR_API_BASE.endswith("/v1") else _ASR_API_BASE,
+        )
+        resp = client.chat.completions.create(
+            model=_ASR_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "audio_url", "audio_url": {"url": public_url}}
+                ]
+            }],
+            timeout=600,
+        )
+    except Exception as e:
+        err_msg = str(e)[:200]
         return {"language": "zh", "duration": round(duration, 2),
                 "segments": [{"start": 0.0, "end": round(duration, 2),
-                              "text": f"(转录提交失败: {err[:100]})"}]}
+                              "text": f"(转录失败: {err_msg})"}]}
 
-    task_id = resp.output.task_id
-
-    # 轮询结果（最长等 10 分钟）
-    for i in range(120):
-        await asyncio.sleep(5)
-        result = Transcription.fetch(task_id)
-        status = result.output.task_status
-        if status == 'SUCCEEDED':
-            break
-        elif status == 'FAILED':
-            return {"language": "zh", "duration": round(duration, 2),
-                    "segments": [{"start": 0.0, "end": round(duration, 2),
-                                  "text": f"(转录失败: {result.output.message[:200]})"}]}
-    else:
-        return {"language": "zh", "duration": round(duration, 2),
-                "segments": [{"start": 0.0, "end": round(duration, 2),
-                              "text": "(转录超时)"}]}
-
-    # 解析识别结果（需从 transcription_url 额外下载）
-    all_segments = []
+    # 解析返回结果
     full_text = ""
-    import requests as _requests
+    all_segments = []
+    if resp.choices and len(resp.choices) > 0:
+        content = resp.choices[0].message.content or ""
+        full_text = content.strip()
 
-    for r_item in result.output.results:
-        trans_url = r_item.get('transcription_url', '')
-        if not trans_url:
-            continue
-        try:
-            resp_json = _requests.get(trans_url, timeout=30).json()
-        except Exception:
-            continue
-
-        for t_item in resp_json.get('transcripts', []):
-            # 整段文本
-            text = t_item.get('text', '').strip()
-            full_text = (full_text + " " + text).strip() if text else full_text
-
-            # 按句分段（带时间戳）
-            for sentence in t_item.get('sentences', []):
-                s_text = sentence.get('text', '').strip()
-                if s_text:
-                    all_segments.append({
-                        "start": round(sentence.get('begin_time', 0) / 1000.0, 2),
-                        "end": round(sentence.get('end_time', 0) / 1000.0, 2),
-                        "text": s_text
-                    })
-
-    if not all_segments:
+    if full_text:
+        # 没有时间戳信息时，整段作为一个 segment
+        all_segments.append({
+            "start": 0.0,
+            "end": round(duration, 2),
+            "text": full_text
+        })
+    else:
         all_segments = [{"start": 0.0, "end": round(duration, 2), "text": "(无识别结果)"}]
 
     return {
@@ -1225,6 +1212,65 @@ async def login(data: dict):
     token = create_token(username)
     return {"username": username, "token": token}
 
+# ============ 微信一键登录 ============
+@app.post("/api/auth/wx-login")
+async def wx_login(data: dict):
+    """微信登录：code → jscode2session → openid → JWT"""
+    import httpx
+
+    code = (data.get("code") or "").strip()
+    if not code or len(code) < 4:
+        raise HTTPException(400, "无效的微信临时凭证")
+
+    if not _WX_APPID or not _WX_SECRET:
+        raise HTTPException(501, "微信登录功能未配置（请联系管理员设置 WX_APPID 和 WX_SECRET）")
+
+    # 调微信 jscode2session 接口
+    wx_url = "https://api.weixin.qq.com/sns/jscode2session"
+    params = {
+        "appid": _WX_APPID,
+        "secret": _WX_SECRET,
+        "js_code": code,
+        "grant_type": "authorization_code",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(wx_url, params=params)
+            wx_data = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"调用微信接口失败: {str(e)[:100]}")
+
+    openid = wx_data.get("openid")
+    if not openid:
+        errmsg = wx_data.get("errmsg", "未知错误")
+        raise HTTPException(401, f"微信登录失败: {errmsg}")
+
+    # session_key 敏感，仅日志记录且不返回前端
+    session_key = wx_data.get("session_key", "")
+    if session_key:
+        print(f"[wx-login] 用户 {openid[:8]}... 登录成功")
+
+    # 用 openid 作为唯一标识（前缀 wx_ 避免冲突）
+    wx_username = f"wx_{openid}"
+
+    # 查找或创建用户
+    conn = sqlite3.connect(str(USERS_DB))
+    row = conn.execute("SELECT username FROM users WHERE username = ?", (wx_username,)).fetchone()
+    if not row:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (wx_username, "wx_only", time.time())
+        )
+        conn.commit()
+        print(f"[wx-login] 新用户注册: {wx_username[:16]}...")
+    conn.close()
+
+    # 生成 JWT token
+    token = create_token(wx_username)
+
+    return {"token": token, "openid": openid, "nickname": "微信用户", "avatar": ""}
+
 @app.get("/api/auth/me")
 async def me(username: str = Depends(get_current_user)):
     return {"username": username}
@@ -1507,21 +1553,53 @@ async def transcribe_url(
 @app.get("/api/task/{task_id}")
 async def get_task(task_id: str):
     t = tasks.get(task_id)
-    if not t:
-        result_file = RESULTS_DIR / f"{task_id}.json"
-        if result_file.exists():
-            # 从文件恢复
-            return {"task_id": task_id, "status": "completed", "message": "✅ 完成", "progress": 100}
+    resp = None
+
+    if t:
+        resp = {
+            "task_id": t.get("id", task_id),
+            "status": t["status"],
+            "progress": t["progress"],
+            "message": t.get("message", ""),
+            "error": t.get("error"),
+            "mode": t.get("mode", "upload"),
+            "title": t.get("title"),
+            "result_url": f"/view/{task_id}" if t["status"] == "completed" else None
+        }
+        # 优先从内存取 result
+        if t.get("result"):
+            resp["result"] = t["result"]
+        else:
+            # 内存无 result → 尝试从文件恢复
+            rfile = RESULTS_DIR / f"{task_id}.json"
+            if rfile.exists():
+                try:
+                    resp["result"] = json.loads(rfile.read_text())
+                    resp["status"] = "completed"
+                    resp["progress"] = 100
+                    resp["message"] = "✅ 完成"
+                except Exception:
+                    pass
+    else:
+        # 任务不在内存中 → 尝试从文件恢复
+        rfile = RESULTS_DIR / f"{task_id}.json"
+        if rfile.exists():
+            try:
+                result = json.loads(rfile.read_text())
+                resp = {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "progress": 100,
+                    "message": "✅ 完成",
+                    "result_url": f"/view/{task_id}",
+                    "result": result
+                }
+            except Exception:
+                pass
+
+    if not resp:
         raise HTTPException(404, "任务不存在")
-    resp = {
-        "task_id": t.get("id", task_id), "status": t["status"],
-        "progress": t["progress"], "message": t.get("message", ""),
-        "error": t.get("error"),
-        "mode": t.get("mode", "upload"),
-        "title": t.get("title"),
-        "result_url": f"/view/{task_id}" if t["status"] == "completed" else None
-    }
-    resp["result"] = t.get("result")
+
     return resp
 
 @app.get("/api/tasks")
