@@ -247,10 +247,11 @@ def do_checkin(username: str) -> dict:
     else:
         new_bonus = CHECKIN_BONUS_MINUTES * 60
         # UPSERT: 如果用户已存在则 UPDATE，否则 INSERT
+        # 注意：user_quota 的 PK 是 username，不含 month
         conn.execute(
             "INSERT INTO user_quota (username, month, bonus_seconds, last_checkin_date) "
             "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(username, month) DO UPDATE SET "
+            "ON CONFLICT(username) DO UPDATE SET "
             "bonus_seconds=bonus_seconds+?, last_checkin_date=?",
             (username, month, new_bonus, today, CHECKIN_BONUS_MINUTES * 60, today)
         )
