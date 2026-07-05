@@ -458,40 +458,17 @@ def save_tasks():
 load_tasks()
 
 # ============================================================
+# 百炼工作空间 ASR（通过 DashScope 原生 API 调用 fun-asr-flash）
+# 注意：工作空间 API 在阿里云内网，需确保音频 URL 可被拉取
 # ============================================================
-# 本地 FunASR SenseVoiceSmall 转录（不依赖云端网络）
-# ============================================================
-# 全局缓存模型实例（只在首次调用时加载）
-_ASR_MODEL_INSTANCE = None
-_ASR_MODEL_LOCK = None
-
-def _get_asr_model():
-    """延迟加载 FunASR SenseVoiceSmall 模型，支持中文/英文/日语/粤语/韩语"""
-    global _ASR_MODEL_INSTANCE, _ASR_MODEL_LOCK
-    if _ASR_MODEL_INSTANCE is not None:
-        return _ASR_MODEL_INSTANCE
-    import threading
-    if _ASR_MODEL_LOCK is None:
-        _ASR_MODEL_LOCK = threading.Lock()
-    with _ASR_MODEL_LOCK:
-        if _ASR_MODEL_INSTANCE is not None:
-            return _ASR_MODEL_INSTANCE
-        from funasr import AutoModel
-        import logging
-        logging.getLogger("funasr").setLevel(logging.WARNING)
-        _ASR_MODEL_INSTANCE = AutoModel(
-            model="iic/SenseVoiceSmall",
-            vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-            punc_model="iic/punc_ct-transformer_cn-en-common-vocab471067-large",
-            disable_update=True,
-            device="cpu",
-        )
-        return _ASR_MODEL_INSTANCE
-
 async def transcribe_audio(audio_path: Path) -> dict:
-    """用本地 FunASR SenseVoiceSmall 转录（不依赖云端）"""
-    import subprocess, json, time
-    import numpy as np
+    """调用百炼工作空间 fun-asr-flash 云端转录"""
+    import subprocess, json, time, asyncio, urllib.parse
+    import httpx
+
+    _ASR_API_BASE = os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com")
+    _ASR_API_KEY = _DASHSCOPE_KEY or os.environ.get("DASHSCOPE_API_KEY", "")
+    _ASR_MODEL = os.environ.get("ASR_MODEL", "fun-asr-flash-2026-06-15")
 
     # 获取音频时长
     def _get_duration() -> float:
@@ -513,50 +490,103 @@ async def transcribe_audio(audio_path: Path) -> dict:
         return {"language": "zh", "duration": 0,
                 "segments": [{"start": 0.0, "end": 0.0, "text": "(音频时长获取失败)"}]}
 
-    # 在后台线程运行 FunASR（阻塞式 CPU 密集型任务）
-    loop = asyncio.get_event_loop()
+    # 构建文件公开 URL（供百炼 API 拉取音频）
+    filename = audio_path.name
     try:
-        model = _get_asr_model()
-        result = await loop.run_in_executor(None, lambda: model.generate(
-            input=str(audio_path),
-            language="auto",
-            use_itn=True,
-            ban_emo_unk=False,
-            batch_size_s=0,
-        ))
-    except Exception as e:
-        err_msg = str(e)[:200]
+        relative = audio_path.relative_to(UPLOAD_DIR)
+        temp_path = str(relative)
+    except ValueError:
+        temp_path = filename
+    encoded_path = urllib.parse.quote(temp_path, safe='/')
+    public_url = f"{_PUBLIC_BASE_URL}/temp_audio/{encoded_path}"
+
+    # 通过 DashScope 原生 API 提交异步转录
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.post(
+                f"{_ASR_API_BASE}/api/v1/services/asr/transcriptions",
+                headers={
+                    "Authorization": f"Bearer {_ASR_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": _ASR_MODEL,
+                    "input": {"file_urls": [public_url]},
+                },
+            )
+        except Exception as e:
+            return {"language": "zh", "duration": round(duration, 2),
+                    "segments": [{"start": 0.0, "end": round(duration, 2),
+                                  "text": f"(转录失败: 网络错误 - {str(e)[:100]})"}]}
+
+    if resp.status_code != 200:
+        try:
+            err_detail = resp.json()
+            err_msg = err_detail.get("message", str(resp.text[:200]))
+        except Exception:
+            err_msg = str(resp.text[:200])
         return {"language": "zh", "duration": round(duration, 2),
                 "segments": [{"start": 0.0, "end": round(duration, 2),
                               "text": f"(转录失败: {err_msg})"}]}
 
-    # 解析返回结果
+    # 解析任务 ID 并轮询结果
+    body = resp.json()
+    task_id = body.get("output", {}).get("task_id", "")
+    if not task_id:
+        return {"language": "zh", "duration": round(duration, 2),
+                "segments": [{"start": 0.0, "end": round(duration, 2),
+                              "text": "(转录失败: 未获取到任务ID)"}]}
+
+    # 轮询结果（最长 10 分钟）
+    async with httpx.AsyncClient(timeout=30) as client:
+        for i in range(120):
+            await asyncio.sleep(5)
+            try:
+                poll = await client.get(
+                    f"{_ASR_API_BASE}/api/v1/services/asr/transcriptions/{task_id}",
+                    headers={"Authorization": f"Bearer {_ASR_API_KEY}"},
+                )
+                poll_body = poll.json()
+                status = poll_body.get("output", {}).get("task_status", "")
+                if status == "SUCCEEDED":
+                    break
+                elif status == "FAILED":
+                    err_msg = poll_body.get("output", {}).get("message", "未知错误")
+                    return {"language": "zh", "duration": round(duration, 2),
+                            "segments": [{"start": 0.0, "end": round(duration, 2),
+                                          "text": f"(转录失败: {err_msg[:200]})"}]}
+            except Exception:
+                continue
+        else:
+            return {"language": "zh", "duration": round(duration, 2),
+                    "segments": [{"start": 0.0, "end": round(duration, 2),
+                                  "text": "(转录超时)"}]}
+
+    # 解析识别结果
     all_segments = []
     full_text = ""
-    if isinstance(result, list):
-        for item in result:
-            if isinstance(item, dict):
-                text = item.get("text", "") or ""
-                ts_list = item.get("timestamp", [])
-                if ts_list and len(ts_list) >= 2:
-                    start_ts = float(ts_list[0]) if ts_list[0] is not None else 0.0
-                    end_ts = float(ts_list[1]) if ts_list[1] is not None else round(duration, 2)
-                else:
-                    start_ts, end_ts = 0.0, round(duration, 2)
-                all_segments.append({
-                    "start": start_ts,
-                    "end": end_ts,
-                    "text": text.strip()
-                })
-                full_text += text
-            elif isinstance(item, str):
-                full_text += item
+    for r_item in poll_body.get("output", {}).get("results", []):
+        trans_url = r_item.get("transcription_url", "")
+        if trans_url:
+            try:
+                import requests as _requests
+                seg_resp = _requests.get(trans_url, timeout=30)
+                seg_data = seg_resp.json()
+                for seg in seg_data.get("transcripts", []):
+                    text = seg.get("text", "").strip()
+                    if text:
+                        all_segments.append({
+                            "start": seg.get("begin_time", 0.0),
+                            "end": seg.get("end_time", round(duration, 2)),
+                            "text": text,
+                        })
+                        full_text += text
+            except Exception:
+                pass
 
     if not all_segments and full_text.strip():
         all_segments.append({
-            "start": 0.0,
-            "end": round(duration, 2),
-            "text": full_text.strip()
+            "start": 0.0, "end": round(duration, 2), "text": full_text.strip()
         })
 
     if not all_segments:
@@ -565,7 +595,7 @@ async def transcribe_audio(audio_path: Path) -> dict:
     return {
         "language": "zh",
         "duration": round(duration, 2),
-        "segments": all_segments
+        "segments": all_segments,
     }
 
 async def llm_process(transcript: dict) -> dict:
