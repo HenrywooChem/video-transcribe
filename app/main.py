@@ -225,8 +225,9 @@ def get_user_quota(username: str) -> dict:
     }
 
 def do_checkin(username: str) -> dict:
-    """每日签到，奖励 5 分钟"""
+    """每日签到，奖励 5 分钟（使用 UPSERT 避免并发冲突）"""
     conn = sqlite3.connect(str(USERS_DB))
+    conn.execute("PRAGMA busy_timeout=5000")
     month = get_current_month()
     today = get_today()
     row = conn.execute(
@@ -245,9 +246,13 @@ def do_checkin(username: str) -> dict:
         )
     else:
         new_bonus = CHECKIN_BONUS_MINUTES * 60
+        # UPSERT: 如果用户已存在则 UPDATE，否则 INSERT
         conn.execute(
-            "INSERT INTO user_quota (username, month, bonus_seconds, last_checkin_date) VALUES (?, ?, ?, ?)",
-            (username, month, new_bonus, today)
+            "INSERT INTO user_quota (username, month, bonus_seconds, last_checkin_date) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(username, month) DO UPDATE SET "
+            "bonus_seconds=bonus_seconds+?, last_checkin_date=?",
+            (username, month, new_bonus, today, CHECKIN_BONUS_MINUTES * 60, today)
         )
     conn.commit()
     conn.close()
@@ -454,16 +459,39 @@ load_tasks()
 
 # ============================================================
 # ============================================================
-# 百炼工作空间 ASR（通过 OpenAI 兼容接口调用 fun-asr-flash）
+# 本地 FunASR SenseVoiceSmall 转录（不依赖云端网络）
 # ============================================================
-async def transcribe_audio(audio_path: Path) -> dict:
-    """用百炼工作空间 fun-asr-flash 云端转录"""
-    import subprocess, json, time
-    from openai import OpenAI
+# 全局缓存模型实例（只在首次调用时加载）
+_ASR_MODEL_INSTANCE = None
+_ASR_MODEL_LOCK = None
 
-    _ASR_API_BASE = os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com")
-    _ASR_API_KEY = _DASHSCOPE_KEY or os.environ.get("DASHSCOPE_API_KEY", "")
-    _ASR_MODEL = os.environ.get("ASR_MODEL", "fun-asr-flash-2026-06-15")
+def _get_asr_model():
+    """延迟加载 FunASR SenseVoiceSmall 模型，支持中文/英文/日语/粤语/韩语"""
+    global _ASR_MODEL_INSTANCE, _ASR_MODEL_LOCK
+    if _ASR_MODEL_INSTANCE is not None:
+        return _ASR_MODEL_INSTANCE
+    import threading
+    if _ASR_MODEL_LOCK is None:
+        _ASR_MODEL_LOCK = threading.Lock()
+    with _ASR_MODEL_LOCK:
+        if _ASR_MODEL_INSTANCE is not None:
+            return _ASR_MODEL_INSTANCE
+        from funasr import AutoModel
+        import logging
+        logging.getLogger("funasr").setLevel(logging.WARNING)
+        _ASR_MODEL_INSTANCE = AutoModel(
+            model="iic/SenseVoiceSmall",
+            vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+            punc_model="iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+            disable_update=True,
+            device="cpu",
+        )
+        return _ASR_MODEL_INSTANCE
+
+async def transcribe_audio(audio_path: Path) -> dict:
+    """用本地 FunASR SenseVoiceSmall 转录（不依赖云端）"""
+    import subprocess, json, time
+    import numpy as np
 
     # 获取音频时长
     def _get_duration() -> float:
@@ -485,33 +513,17 @@ async def transcribe_audio(audio_path: Path) -> dict:
         return {"language": "zh", "duration": 0,
                 "segments": [{"start": 0.0, "end": 0.0, "text": "(音频时长获取失败)"}]}
 
-    # 构建文件公开 URL
-    filename = audio_path.name
-    import urllib.parse
+    # 在后台线程运行 FunASR（阻塞式 CPU 密集型任务）
+    loop = asyncio.get_event_loop()
     try:
-        relative = audio_path.relative_to(UPLOAD_DIR)
-        temp_path = str(relative)
-    except ValueError:
-        temp_path = filename
-    encoded_path = urllib.parse.quote(temp_path, safe='/')
-    public_url = f"{_PUBLIC_BASE_URL}/temp_audio/{encoded_path}"
-
-    # 用 OpenAI 兼容接口调用 ASR（同步）
-    try:
-        client = OpenAI(
-            api_key=_ASR_API_KEY,
-            base_url=f"{_ASR_API_BASE}/compatible-mode/v1" if not _ASR_API_BASE.endswith("/v1") else _ASR_API_BASE,
-        )
-        resp = client.chat.completions.create(
-            model=_ASR_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "audio_url", "audio_url": {"url": public_url}}
-                ]
-            }],
-            timeout=600,
-        )
+        model = _get_asr_model()
+        result = await loop.run_in_executor(None, lambda: model.generate(
+            input=str(audio_path),
+            language="auto",
+            use_itn=True,
+            ban_emo_unk=False,
+            batch_size_s=0,
+        ))
     except Exception as e:
         err_msg = str(e)[:200]
         return {"language": "zh", "duration": round(duration, 2),
@@ -519,20 +531,35 @@ async def transcribe_audio(audio_path: Path) -> dict:
                               "text": f"(转录失败: {err_msg})"}]}
 
     # 解析返回结果
-    full_text = ""
     all_segments = []
-    if resp.choices and len(resp.choices) > 0:
-        content = resp.choices[0].message.content or ""
-        full_text = content.strip()
+    full_text = ""
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict):
+                text = item.get("text", "") or ""
+                ts_list = item.get("timestamp", [])
+                if ts_list and len(ts_list) >= 2:
+                    start_ts = float(ts_list[0]) if ts_list[0] is not None else 0.0
+                    end_ts = float(ts_list[1]) if ts_list[1] is not None else round(duration, 2)
+                else:
+                    start_ts, end_ts = 0.0, round(duration, 2)
+                all_segments.append({
+                    "start": start_ts,
+                    "end": end_ts,
+                    "text": text.strip()
+                })
+                full_text += text
+            elif isinstance(item, str):
+                full_text += item
 
-    if full_text:
-        # 没有时间戳信息时，整段作为一个 segment
+    if not all_segments and full_text.strip():
         all_segments.append({
             "start": 0.0,
             "end": round(duration, 2),
-            "text": full_text
+            "text": full_text.strip()
         })
-    else:
+
+    if not all_segments:
         all_segments = [{"start": 0.0, "end": round(duration, 2), "text": "(无识别结果)"}]
 
     return {
@@ -1292,7 +1319,10 @@ async def api_quota(username: str = Depends(get_current_user)):
 @app.post("/api/checkin")
 async def api_checkin(username: str = Depends(get_current_user)):
     """每日签到"""
-    return do_checkin(username)
+    try:
+        return do_checkin(username)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e)[:200])
 
 @app.get("/api/quota/pricing")
 async def api_pricing():
