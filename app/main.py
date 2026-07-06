@@ -260,24 +260,17 @@ def do_checkin(username: str) -> dict:
     return {"success": True, "message": f"签到成功！+{CHECKIN_BONUS_MINUTES}分钟额度", "bonus_seconds": new_bonus}
 
 def deduct_quota(username: str, seconds: float):
-    """扣除用户额度（转录完成时调用）"""
+    """扣除用户额度（转录完成时调用，UPSERT 避免并发冲突）"""
     conn = sqlite3.connect(str(USERS_DB))
+    conn.execute("PRAGMA busy_timeout=5000")
     month = get_current_month()
-    row = conn.execute(
-        "SELECT used_seconds FROM user_quota WHERE username=? AND month=?",
-        (username, month)
-    ).fetchone()
-    if row:
-        new_used = (row[0] or 0) + seconds
-        conn.execute(
-            "UPDATE user_quota SET used_seconds=? WHERE username=? AND month=?",
-            (new_used, username, month)
-        )
-    else:
-        conn.execute(
-            "INSERT INTO user_quota (username, month, used_seconds) VALUES (?, ?, ?)",
-            (username, month, seconds)
-        )
+    conn.execute(
+        "INSERT INTO user_quota (username, month, used_seconds) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(username) DO UPDATE SET "
+        "used_seconds = used_seconds + ?",
+        (username, month, seconds, seconds)
+    )
     conn.commit()
     conn.close()
 
