@@ -647,16 +647,37 @@ async def _try_tencent_asr(audio_path: Path, dur_rounded: float) -> dict | None:
         cred = tc_cred.Credential(tx_id, tx_key)
         client = asr_client.AsrClient(cred, "ap-guangzhou")
 
-        with open(str(audio_path), "rb") as f:
-            audio_data = base64.b64encode(f.read()).decode("utf-8")
+        # 读取音频文件
+        audio_path_str = str(audio_path)
+        raw_size = os.path.getsize(audio_path_str)
 
-        req = models.CreateRecTaskRequest()
-        req.EngineModelType = "16k_zh"
-        req.ChannelNum = 1
-        req.ResTextFormat = 1  # 带标点
-        req.SourceType = 1     # 直传
-        req.Data = audio_data
-        req.DataLen = len(audio_data)
+        # 小文件直传，大文件用 URL（腾讯云内网可访问）
+        if raw_size <= 3_500_000:  # base64 后不超过 5MB
+            with open(audio_path_str, "rb") as f:
+                audio_data = base64.b64encode(f.read()).decode("utf-8")
+            req = models.CreateRecTaskRequest()
+            req.EngineModelType = "16k_zh"
+            req.ChannelNum = 1
+            req.ResTextFormat = 1
+            req.SourceType = 1          # 直传
+            req.Data = audio_data
+            req.DataLen = raw_size      # 原始文件大小，不是 base64 长度
+        else:
+            # URL 模式：用公网 IP + HTTP（同腾讯云内网可达）
+            import urllib.parse
+            try:
+                relative = audio_path.relative_to(Path("/home/ubuntu/video-transcribe/data/uploads"))
+                temp_path = str(relative)
+            except ValueError:
+                temp_path = audio_path.name
+            encoded_path = urllib.parse.quote(temp_path, safe='/')
+            public_url = f"http://124.221.77.205:8000/temp_audio/{encoded_path}"
+            req = models.CreateRecTaskRequest()
+            req.EngineModelType = "16k_zh"
+            req.ChannelNum = 1
+            req.ResTextFormat = 1
+            req.SourceType = 0          # URL 模式
+            req.Url = public_url
 
         resp = client.CreateRecTask(req)
         task_id = resp.Data.TaskId
