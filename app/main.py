@@ -459,19 +459,19 @@ def save_tasks():
 load_tasks()
 
 # ============================================================
-# 百炼工作空间 ASR（通过 DashScope 原生 API 调用 fun-asr-flash）
-# 注意：工作空间 API 在阿里云内网，需确保音频 URL 可被拉取
+# 双 ASR 容灾转录：阿里百炼（主）→ 腾讯云 ASR（备）
 # ============================================================
+# 腾讯云 ASR 密钥（从环境变量读取）
+_TX_SECRET_ID = os.environ.get("TX_SECRET_ID", "")
+_TX_SECRET_KEY = os.environ.get("TX_SECRET_KEY", "")
+
 async def transcribe_audio(audio_path: Path) -> dict:
-    """调用百炼工作空间 fun-asr-flash 云端转录"""
-    import subprocess, json, time, asyncio, urllib.parse
+    """双 ASR 转录：主用阿里百炼，备用腾讯云"""
+    import subprocess, json, time, asyncio, urllib.parse, base64
     import httpx
+    from pathlib import Path
 
-    _ASR_API_BASE = os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com")
-    _ASR_API_KEY = _DASHSCOPE_KEY or os.environ.get("DASHSCOPE_API_KEY", "")
-    _ASR_MODEL = os.environ.get("ASR_MODEL", "fun-asr-flash-2026-06-15")
-
-    # 获取音频时长
+    # ===== 获取音频时长 =====
     def _get_duration() -> float:
         cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
                "-show_streams", str(audio_path)]
@@ -491,19 +491,49 @@ async def transcribe_audio(audio_path: Path) -> dict:
         return {"language": "zh", "duration": 0,
                 "segments": [{"start": 0.0, "end": 0.0, "text": "(音频时长获取失败)"}]}
 
-    # 构建文件公开 URL（供百炼 API 拉取音频）
+    dur_rounded = round(duration, 2)
+
+    # ===== 尝试阿里百炼 =====
+    result = await _try_aliyun_asr(audio_path, dur_rounded)
+    if result is not None:
+        return result
+
+    # ===== 阿里失败，降级到腾讯云 =====
+    print(f"[ASR] 阿里百炼降级，切换到腾讯云 ASR")
+    result = await _try_tencent_asr(audio_path, dur_rounded)
+    if result is not None:
+        return result
+
+    # ===== 都失败 =====
+    return {"language": "zh", "duration": dur_rounded,
+            "segments": [{"start": 0.0, "end": dur_rounded, "text": "(所有ASR均不可用)"}]}
+
+
+async def _try_aliyun_asr(audio_path: Path, dur_rounded: float) -> dict | None:
+    """尝试阿里百炼工作空间 fun-asr-flash"""
+    import json, asyncio, urllib.parse
+    import httpx
+
+    _ASR_API_BASE = os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com")
+    _ASR_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+    _ASR_MODEL = os.environ.get("ASR_MODEL", "fun-asr-flash-2026-06-15")
+    _PUBLIC_BASE_URL = "https://ai4u.site"
+
+    if not _ASR_API_KEY:
+        return None
+
+    # 构建文件公开 URL
     filename = audio_path.name
     try:
-        relative = audio_path.relative_to(UPLOAD_DIR)
+        relative = audio_path.relative_to(Path("/home/ubuntu/video-transcribe/data/uploads"))
         temp_path = str(relative)
     except ValueError:
         temp_path = filename
     encoded_path = urllib.parse.quote(temp_path, safe='/')
     public_url = f"{_PUBLIC_BASE_URL}/temp_audio/{encoded_path}"
 
-    # 通过 DashScope 原生 API 提交异步转录
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{_ASR_API_BASE}/api/v1/services/asr/transcriptions",
                 headers={
@@ -515,27 +545,29 @@ async def transcribe_audio(audio_path: Path) -> dict:
                     "input": {"file_urls": [public_url]},
                 },
             )
-        except Exception as e:
-            return {"language": "zh", "duration": round(duration, 2),
-                    "segments": [{"start": 0.0, "end": round(duration, 2),
-                                  "text": f"(转录失败: 网络错误 - {str(e)[:100]})"}]}
+    except Exception as e:
+        print(f"[阿里ASR] 网络错误: {e}")
+        return None
 
     if resp.status_code != 200:
         try:
-            err_detail = resp.json()
-            err_msg = err_detail.get("message", str(resp.text[:200]))
+            err_body = resp.json()
+            err_msg = err_body.get("message", "")
         except Exception:
-            err_msg = str(resp.text[:200])
-        return {"language": "zh", "duration": round(duration, 2),
-                "segments": [{"start": 0.0, "end": round(duration, 2),
-                              "text": f"(转录失败: {err_msg})"}]}
+            err_msg = resp.text[:200]
+        # "url error" 是网络不可达的错误，需要降级
+        if "url error" in err_msg:
+            print(f"[阿里ASR] 网络不可达，降级")
+            return None
+        return {"language": "zh", "duration": dur_rounded,
+                "segments": [{"start": 0.0, "end": dur_rounded,
+                              "text": f"(转录失败: {err_msg[:200]})"}]}
 
-    # 解析任务 ID 并轮询结果
     body = resp.json()
     task_id = body.get("output", {}).get("task_id", "")
     if not task_id:
-        return {"language": "zh", "duration": round(duration, 2),
-                "segments": [{"start": 0.0, "end": round(duration, 2),
+        return {"language": "zh", "duration": dur_rounded,
+                "segments": [{"start": 0.0, "end": dur_rounded,
                               "text": "(转录失败: 未获取到任务ID)"}]}
 
     # 轮询结果（最长 10 分钟）
@@ -553,14 +585,14 @@ async def transcribe_audio(audio_path: Path) -> dict:
                     break
                 elif status == "FAILED":
                     err_msg = poll_body.get("output", {}).get("message", "未知错误")
-                    return {"language": "zh", "duration": round(duration, 2),
-                            "segments": [{"start": 0.0, "end": round(duration, 2),
+                    return {"language": "zh", "duration": dur_rounded,
+                            "segments": [{"start": 0.0, "end": dur_rounded,
                                           "text": f"(转录失败: {err_msg[:200]})"}]}
             except Exception:
                 continue
         else:
-            return {"language": "zh", "duration": round(duration, 2),
-                    "segments": [{"start": 0.0, "end": round(duration, 2),
+            return {"language": "zh", "duration": dur_rounded,
+                    "segments": [{"start": 0.0, "end": dur_rounded,
                                   "text": "(转录超时)"}]}
 
     # 解析识别结果
@@ -578,7 +610,7 @@ async def transcribe_audio(audio_path: Path) -> dict:
                     if text:
                         all_segments.append({
                             "start": seg.get("begin_time", 0.0),
-                            "end": seg.get("end_time", round(duration, 2)),
+                            "end": seg.get("end_time", dur_rounded),
                             "text": text,
                         })
                         full_text += text
@@ -587,17 +619,107 @@ async def transcribe_audio(audio_path: Path) -> dict:
 
     if not all_segments and full_text.strip():
         all_segments.append({
-            "start": 0.0, "end": round(duration, 2), "text": full_text.strip()
+            "start": 0.0, "end": dur_rounded, "text": full_text.strip()
         })
-
     if not all_segments:
-        all_segments = [{"start": 0.0, "end": round(duration, 2), "text": "(无识别结果)"}]
+        all_segments = [{"start": 0.0, "end": dur_rounded, "text": "(无识别结果)"}]
 
-    return {
-        "language": "zh",
-        "duration": round(duration, 2),
-        "segments": all_segments,
-    }
+    return {"language": "zh", "duration": dur_rounded, "segments": all_segments}
+
+
+async def _try_tencent_asr(audio_path: Path, dur_rounded: float) -> dict | None:
+    """备用：腾讯云 ASR 录音文件识别（直传音频）"""
+    import base64, json, time as _time
+
+    tx_id = os.environ.get("TX_SECRET_ID", "")
+    tx_key = os.environ.get("TX_SECRET_KEY", "")
+    if not tx_id or not tx_key:
+        return None
+
+    try:
+        from tencentcloud.common import credential as tc_cred
+        from tencentcloud.asr.v20190614 import asr_client, models
+    except ImportError:
+        print("[腾讯ASR] SDK 未安装")
+        return None
+
+    try:
+        cred = tc_cred.Credential(tx_id, tx_key)
+        client = asr_client.AsrClient(cred, "ap-guangzhou")
+
+        with open(str(audio_path), "rb") as f:
+            audio_data = base64.b64encode(f.read()).decode("utf-8")
+
+        req = models.CreateRecTaskRequest()
+        req.EngineModelType = "16k_zh"
+        req.ChannelNum = 1
+        req.ResTextFormat = 1  # 带标点
+        req.SourceType = 1     # 直传
+        req.Data = audio_data
+        req.DataLen = len(audio_data)
+
+        resp = client.CreateRecTask(req)
+        task_id = resp.Data.TaskId
+    except Exception as e:
+        print(f"[腾讯ASR] 提交失败: {e}")
+        return None
+
+    # 轮询结果（最长 5 分钟）
+    for i in range(150):
+        await asyncio.sleep(2)
+        try:
+            req2 = models.DescribeTaskStatusRequest()
+            req2.TaskId = task_id
+            resp2 = client.DescribeTaskStatus(req2)
+            status = resp2.Data.Status
+            if status == 2:  # 成功
+                result_str = resp2.Data.Result
+                if not result_str:
+                    return {"language": "zh", "duration": dur_rounded,
+                            "segments": [{"start": 0.0, "end": dur_rounded,
+                                          "text": "(无识别结果)"}]}
+                # 解析结果
+                all_segments = []
+                full_text = ""
+                for line in result_str.strip().split("\n"):
+                    # 格式: [start,end] text
+                    if line.startswith("["):
+                        parts = line.split("]", 1)
+                        if len(parts) == 2:
+                            text = parts[1].strip()
+                            if text:
+                                all_segments.append({
+                                    "start": 0.0, "end": dur_rounded, "text": text,
+                                })
+                                full_text += text
+                    else:
+                        text = line.strip()
+                        if text:
+                            all_segments.append({
+                                "start": 0.0, "end": dur_rounded, "text": text,
+                            })
+                            full_text += text
+
+                if not all_segments and full_text.strip():
+                    all_segments.append({
+                        "start": 0.0, "end": dur_rounded, "text": full_text.strip()
+                    })
+                if not all_segments:
+                    all_segments = [{"start": 0.0, "end": dur_rounded, "text": "(无识别结果)"}]
+
+                return {"language": "zh", "duration": dur_rounded, "segments": all_segments}
+
+            elif status == 3:  # 失败
+                print(f"[腾讯ASR] 失败: {resp2.Data.ErrorMsg}")
+                return {"language": "zh", "duration": dur_rounded,
+                        "segments": [{"start": 0.0, "end": dur_rounded,
+                                      "text": f"(转录失败: {resp2.Data.ErrorMsg[:200]})"}]}
+        except Exception as e:
+            print(f"[腾讯ASR] 轮询错误: {e}")
+            continue
+
+    return {"language": "zh", "duration": dur_rounded,
+            "segments": [{"start": 0.0, "end": dur_rounded, "text": "(转录超时)"}]}
 
 async def llm_process(transcript: dict) -> dict:
     full_text = " ".join(s["text"] for s in transcript["segments"])
