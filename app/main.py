@@ -158,15 +158,31 @@ def get_today() -> str:
 def init_quota_db():
     """初始化额度表和支付订单表"""
     conn = sqlite3.connect(str(USERS_DB))
+    # 创建新表（含复合主键(username, month)）
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_quota (
-            username TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS user_quota_new (
+            username TEXT NOT NULL,
             month TEXT NOT NULL,
             used_seconds REAL DEFAULT 0,
             bonus_seconds REAL DEFAULT 0,
-            last_checkin_date TEXT
+            last_checkin_date TEXT,
+            PRIMARY KEY (username, month)
         )
     """)
+    # 检查旧表是否存在，迁移数据
+    has_old = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='user_quota'"
+    ).fetchone()
+    if has_old:
+        # 检查旧表是否有 month 列
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(user_quota)")]
+        if 'month' in cols:
+            conn.execute("""
+                INSERT OR IGNORE INTO user_quota_new (username, month, used_seconds, bonus_seconds, last_checkin_date)
+                SELECT username, month, used_seconds, bonus_seconds, last_checkin_date FROM user_quota
+            """)
+        conn.execute("DROP TABLE user_quota")
+    conn.execute("ALTER TABLE user_quota_new RENAME TO user_quota")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS payment_orders (
             id TEXT PRIMARY KEY,
@@ -225,7 +241,7 @@ def get_user_quota(username: str) -> dict:
     }
 
 def do_checkin(username: str) -> dict:
-    """每日签到，奖励 5 分钟（使用 UPSERT 避免并发冲突）"""
+    """每日签到，奖励 5 分钟"""
     conn = sqlite3.connect(str(USERS_DB))
     conn.execute("PRAGMA busy_timeout=5000")
     month = get_current_month()
@@ -246,12 +262,11 @@ def do_checkin(username: str) -> dict:
         )
     else:
         new_bonus = CHECKIN_BONUS_MINUTES * 60
-        # UPSERT: 如果用户已存在则 UPDATE，否则 INSERT
-        # 注意：user_quota 的 PK 是 username，不含 month
+        # 复合主键 (username, month)，每月一条记录
         conn.execute(
             "INSERT INTO user_quota (username, month, bonus_seconds, last_checkin_date) "
             "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(username) DO UPDATE SET "
+            "ON CONFLICT(username, month) DO UPDATE SET "
             "bonus_seconds=bonus_seconds+?, last_checkin_date=?",
             (username, month, new_bonus, today, CHECKIN_BONUS_MINUTES * 60, today)
         )
@@ -260,14 +275,14 @@ def do_checkin(username: str) -> dict:
     return {"success": True, "message": f"签到成功！+{CHECKIN_BONUS_MINUTES}分钟额度", "bonus_seconds": new_bonus}
 
 def deduct_quota(username: str, seconds: float):
-    """扣除用户额度（转录完成时调用，UPSERT 避免并发冲突）"""
+    """扣除用户额度（转录完成时调用）"""
     conn = sqlite3.connect(str(USERS_DB))
     conn.execute("PRAGMA busy_timeout=5000")
     month = get_current_month()
     conn.execute(
         "INSERT INTO user_quota (username, month, used_seconds) "
         "VALUES (?, ?, ?) "
-        "ON CONFLICT(username) DO UPDATE SET "
+        "ON CONFLICT(username, month) DO UPDATE SET "
         "used_seconds = used_seconds + ?",
         (username, month, seconds, seconds)
     )
@@ -486,20 +501,42 @@ async def transcribe_audio(audio_path: Path) -> dict:
 
     dur_rounded = round(duration, 2)
 
-    # ===== 尝试阿里百炼 =====
-    result = await _try_aliyun_asr(audio_path, dur_rounded)
-    if result is not None:
+    # ===== 主选：FunASR 本地推理（零成本） =====
+    from app.funasr_local import transcribe as funasr_transcribe
+    result = await funasr_transcribe(audio_path)
+    if _is_valid_asr_result(result):
         return result
 
-    # ===== 阿里失败，降级到腾讯云 =====
-    print(f"[ASR] 阿里百炼降级，切换到腾讯云 ASR")
+    # ===== FunASR 失败，降级到腾讯云 =====
+    print(f"[ASR] FunASR 本地推理失败，切换到腾讯云 ASR")
     result = await _try_tencent_asr(audio_path, dur_rounded)
-    if result is not None:
+    if _is_valid_asr_result(result):
+        return result
+
+    # ===== 腾讯云也失败，最后试试阿里百炼 =====
+    print(f"[ASR] 腾讯云降级，切换到阿里百炼")
+    result = await _try_aliyun_asr(audio_path, dur_rounded)
+    if _is_valid_asr_result(result):
         return result
 
     # ===== 都失败 =====
     return {"language": "zh", "duration": dur_rounded,
             "segments": [{"start": 0.0, "end": dur_rounded, "text": "(所有ASR均不可用)"}]}
+
+
+def _is_valid_asr_result(result: dict | None) -> bool:
+    """检查 ASR 结果是否包含有效文本"""
+    if result is None:
+        return False
+    segments = result.get("segments", [])
+    if not segments:
+        return False
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        # 过滤掉 "(无识别结果)"、"(所有ASR均不可用)" 等占位信息
+        if text and not text.startswith("("):
+            return True
+    return False
 
 
 async def _try_aliyun_asr(audio_path: Path, dur_rounded: float) -> dict | None:
